@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Mac OS
+.DS_Store
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# If you want to exclude large dataset folders, add them:
+# snore_data/
+# non_snore_data/
+
+# Build / distribution
+build/
+dist/
+*.egg-info/
