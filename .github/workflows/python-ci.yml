@@ -1,0 +1,27 @@
+name: Python CI
+
+on: [push, pull_request]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.12.1"
+
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install librosa soundfile pydub numpy scipy flake8
+
+    - name: Lint with flake8
+      run: |
+        flake8 prepareDataset.py preprocessDataset.py --max-line-length=88
+
+    - name: (Optional) Run your scripts or tests
+      run: |
+        echo "No tests yet, skipping"
