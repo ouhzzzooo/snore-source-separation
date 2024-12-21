@@ -1,25 +1,75 @@
-# Python cache
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 
-# Virtual environments
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+*.wheel
+
+# Virtual environment
 venv/
 env/
 .venv/
 sourceseparation/
 
-# Mac OS
-.DS_Store
+# PyInstaller
+#  Usually these files are written by PyInstaller:
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+.coverage.*
+
+# Translations
+*.mo
+*.pot
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+book/_build/
 
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/
 
-# If you want to exclude large dataset folders, add them:
-# snore_data/
-# non_snore_data/
+# macOS
+.DS_Store
 
-# Build / distribution
-build/
-dist/
-*.egg-info/
+# Windows:
+Thumbs.db
+ehthumbs.db
