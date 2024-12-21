@@ -62,6 +62,16 @@ python prepareDataset.py
 python preprocessDataset.py
 ```
 
+### **Train model for denoising**
+
+```
+python train.py \
+  --model_name UNet1D \
+  --epochs 50 \
+  --batch_size 4 \
+  --train_noisy_dir Dataset/Preprocessed/Train/mixing/noisy \
+```
+
 # References
 [1] 
 
