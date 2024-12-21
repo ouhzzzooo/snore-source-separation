@@ -7,6 +7,7 @@ __pycache__/
 venv/
 env/
 .venv/
+sourceseparation/
 
 # Mac OS
 .DS_Store
