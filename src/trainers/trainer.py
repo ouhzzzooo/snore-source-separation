@@ -1,5 +1,6 @@
 import os
 import glob
+import datetime
 import librosa
 import numpy as np
 from tqdm import tqdm
@@ -11,10 +12,9 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 
 # ----------------------------------------------------------
-# 1) Model Factory and Losses/EarlyStopping (all in one file)
+# 1) Model Factory + Losses + EarlyStopping
 # ----------------------------------------------------------
 
-# a) MODEL FACTORY
 from src.models.UNet1D import UNet1D
 from src.models.AdvancedCNNAutoencoder import AdvancedCNNAutoencoder
 from src.models.AttentionUNet1D import AttentionUNet1D
@@ -36,8 +36,10 @@ def get_model(model_name: str):
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
-# b) LOSSES
 def stft_loss(pred, target):
+    """
+    STFT-based difference in time-frequency domain.
+    """
     if len(pred.shape) == 2:
         pred = pred.unsqueeze(1)
         target = target.unsqueeze(1)
@@ -54,13 +56,17 @@ def stft_loss(pred, target):
     return torch.mean((pred_stft - target_stft).abs())
 
 def combined_loss(pred, target):
-    """Example combined MSE + STFT loss."""
-    mse_loss = nn.MSELoss()(pred, target)
+    """
+    70% MSE + 30% STFT difference
+    """
+    mse = nn.MSELoss()(pred, target)
     stft = stft_loss(pred, target)
-    return 0.7 * mse_loss + 0.3 * stft
+    return 0.7 * mse + 0.3 * stft
 
-# c) EARLY STOPPING
 class EarlyStopping:
+    """
+    If val_loss doesn't improve by min_delta for patience epochs, stop.
+    """
     def __init__(self, patience=5, min_delta=0):
         self.patience = patience
         self.min_delta = min_delta
@@ -71,7 +77,7 @@ class EarlyStopping:
     def __call__(self, val_loss):
         if self.best_loss is None:
             self.best_loss = val_loss
-        elif val_loss < self.best_loss - self.min_delta:
+        elif val_loss < (self.best_loss - self.min_delta):
             self.best_loss = val_loss
             self.counter = 0
         else:
@@ -80,17 +86,18 @@ class EarlyStopping:
                 self.early_stop = True
 
 # ----------------------------------------------------------
-# 2) SNORE DATASET
+# 2) SnoreDataset
 # ----------------------------------------------------------
 class SnoreDataset(Dataset):
     """
-    Custom dataset that loads "noisy" (mixed) .wav files from one folder
-    and "clean" .wav files from another folder (both preprocessed to 16kHz).
+    Loads noisy files from e.g. 'noisy_1_44_2.wav' + tries to match with '1_44.wav'
+    so model can see the correct (input, target) pair.
     """
     def __init__(self, noisy_dir, clean_dir):
         super().__init__()
         self.noisy_files = glob.glob(os.path.join(noisy_dir, "*.wav"))
-        # Build a dict for clean files by filename
+
+        # Build a dictionary for clean files { "1_44.wav": "/full/path/1_44.wav" }
         self.clean_map = {}
         for fpath in glob.glob(os.path.join(clean_dir, "*.wav")):
             fname = os.path.basename(fpath)
@@ -99,42 +106,58 @@ class SnoreDataset(Dataset):
     def __len__(self):
         return len(self.noisy_files)
 
+    def parse_noisy_to_clean(self, noisy_name):
+        """
+        e.g. 'noisy_1_44_2.wav' => '1_44.wav'
+        If it doesn't parse or doesn't exist in self.clean_map => fallback
+        """
+        base_no_ext = os.path.splitext(noisy_name)[0]  # "noisy_1_44_2"
+        parts = base_no_ext.split("_")                 # ["noisy", "1", "44", "2"]
+        if len(parts) >= 3:
+            # join "1" + "_" + "44" => "1_44.wav"
+            candidate = parts[1] + "_" + parts[2] + ".wav"
+            return candidate
+        return None
+
     def __getitem__(self, idx):
+        # 1) Load the noisy file
         noisy_path = self.noisy_files[idx]
         noisy_name = os.path.basename(noisy_path)
 
-        # Load noisy audio
         noisy_audio, _ = librosa.load(noisy_path, sr=16000, mono=True)
-        # Normalize
         max_abs_noisy = np.max(np.abs(noisy_audio)) if len(noisy_audio) else 0
-        if max_abs_noisy > 0:
-            noisy_audio = noisy_audio / max_abs_noisy
+        if max_abs_noisy > 1e-8:
+            noisy_audio /= max_abs_noisy
 
-        # Load clean (snore) audio
-        if noisy_name in self.clean_map:
-            clean_audio, _ = librosa.load(self.clean_map[noisy_name], sr=16000, mono=True)
+        # 2) Parse out the matching clean
+        clean_candidate = self.parse_noisy_to_clean(noisy_name)
+        if clean_candidate and (clean_candidate in self.clean_map):
+            clean_path = self.clean_map[clean_candidate]
+            clean_audio, _ = librosa.load(clean_path, sr=16000, mono=True)
             max_abs_clean = np.max(np.abs(clean_audio)) if len(clean_audio) else 0
-            if max_abs_clean > 0:
-                clean_audio = clean_audio / max_abs_clean
+            if max_abs_clean > 1e-8:
+                clean_audio /= max_abs_clean
         else:
-            # If missing, return zeros or raise an error
+            # fallback to zeros if no match
             clean_audio = np.zeros_like(noisy_audio)
 
-        # Convert to Torch
+        # Return as torch tensors [1, length]
         noisy_tensor = torch.tensor(noisy_audio, dtype=torch.float32).unsqueeze(0)
         clean_tensor = torch.tensor(clean_audio, dtype=torch.float32).unsqueeze(0)
-        return noisy_tensor, clean_tensor
+
+        return (noisy_tensor, clean_tensor)
+
 
 # ----------------------------------------------------------
-# 3) TRAINER CLASS
+# 3) Trainer
 # ----------------------------------------------------------
 class Trainer:
     def __init__(self, args):
         self.args = args
 
-        # Create dataset & dataloader
+        # 1) Create dataset & DataLoader
         self.train_dataset = SnoreDataset(args.train_noisy_dir, args.train_clean_dir)
-        self.val_dataset = SnoreDataset(args.val_noisy_dir, args.val_clean_dir)
+        self.val_dataset   = SnoreDataset(args.val_noisy_dir, args.val_clean_dir)
 
         if len(self.train_dataset) == 0 or len(self.val_dataset) == 0:
             raise ValueError("No data found in the specified directories.")
@@ -154,60 +177,65 @@ class Trainer:
             pin_memory=True,
         )
 
-        # Create model
+        # 2) Create model
         self.model = get_model(args.model_name)
         if torch.cuda.device_count() > 1:
             self.model = nn.DataParallel(self.model)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        # Optimizer & Scheduler
+        # 3) Optimizer & Scheduler
         self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=1e-5)
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min',
-                                                              factor=0.5, patience=3, verbose=True)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        )
 
-        # Loss & EarlyStopping
+        # 4) Loss & EarlyStopping
         self.criterion = combined_loss
         self.early_stopping = EarlyStopping(patience=args.patience, min_delta=0.001)
 
-        # Amp Grad Scaler
+        # 5) AMP Grad Scaler
         self.scaler = GradScaler()
 
-        # Where to save best model
-        os.makedirs(args.output_dir, exist_ok=True)
-        self.model_path = os.path.join(args.output_dir, f"{args.model_name}_best.pth")
+        # 6) Where to save best model: exps/{model_name}/{DATE-TIME}/{model_name}.pth
+        now_str = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
+        self.exp_dir = os.path.join("exps", args.model_name, now_str)
+        os.makedirs(self.exp_dir, exist_ok=True)
+        self.model_path = os.path.join(self.exp_dir, f"{args.model_name}.pth")
 
     def train(self):
-        """Main training loop."""
         best_val_loss = float("inf")
 
         for epoch in range(self.args.epochs):
             print(f"\n----- EPOCH {epoch+1}/{self.args.epochs} -----")
+
+            # Train
             train_loss = self._train_one_epoch(epoch)
+
+            # Validate
             val_loss = self._validate(epoch)
 
-            # Scheduler step (if using ReduceLROnPlateau)
+            # Scheduler step
             self.scheduler.step(val_loss)
 
-            # Check if best
+            # Save if best
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(self.model.state_dict(), self.model_path)
-                print(f"[SAVE] Best model so far => {self.model_path} (val_loss={val_loss:.6f})")
+                print(f"[SAVE] Best => {self.model_path} (val_loss={val_loss:.6f})")
 
-            # Early stop check
+            # Early stop
             self.early_stopping(val_loss)
             if self.early_stopping.early_stop:
                 print("Early stopping triggered.")
                 break
 
         print(f"\nTraining completed. Best validation loss: {best_val_loss:.6f}")
-        print(f"Best model is saved at: {self.model_path}")
+        print(f"Best model at: {self.model_path}")
 
     def _train_one_epoch(self, epoch_idx):
-        """Train the model for one epoch."""
         self.model.train()
-        running_loss = 0.0
+        total_loss = 0.0
 
         for (noisy, clean) in tqdm(self.train_loader, desc=f"Train epoch {epoch_idx+1}"):
             noisy = noisy.to(self.device)
@@ -223,16 +251,15 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            running_loss += loss.item()
+            total_loss += loss.item()
 
-        epoch_loss = running_loss / len(self.train_loader)
+        epoch_loss = total_loss / len(self.train_loader)
         print(f"TRAIN EPOCH {epoch_idx+1} - Loss: {epoch_loss:.6f}")
         return epoch_loss
 
     def _validate(self, epoch_idx):
-        """Validate the model on the validation set."""
         self.model.eval()
-        running_loss = 0.0
+        total_loss = 0.0
 
         with torch.no_grad():
             for (noisy, clean) in tqdm(self.val_loader, desc=f"Val epoch {epoch_idx+1}"):
@@ -243,8 +270,8 @@ class Trainer:
                     output = self.model(noisy)
                     loss = self.criterion(output, clean)
 
-                running_loss += loss.item()
+                total_loss += loss.item()
 
-        val_loss = running_loss / len(self.val_loader)
+        val_loss = total_loss / len(self.val_loader)
         print(f"VAL EPOCH {epoch_idx+1} - Loss: {val_loss:.6f}")
         return val_loss
