@@ -218,16 +218,15 @@ def phase1_basic_preprocessing():
 # 5) Phase 2: Rebuild Noisy with More Variety
 # -------------------------------------------
 
-def rebuild_noisy_data(num_versions=3):
+def rebuild_noisy_data():
     """
-    For each snore file in Preprocessed/original/1,
-    randomly pick a non-snore from Preprocessed/mixing/0.
-    For each (snore, non_snore) pair, create `num_versions` new
-    noisy files with different random augmentations on the non-snore.
+    Rebuild 'noisy' data in Preprocessed from 'original/1' (snore) and 'mixing/0' (non-snore):
+      - Train/Val: we create 3 versions w/ augmentation
+      - Test: 1 version, no augmentation
+      - The resulting noisy files for test are named: 'noisy_{snoreID}_{nonSnoreID}.wav'
+        so we can parse them later to identify the non-snore.
+    """
 
-    We then overlay snore + augmented non-snore and save as:
-    e.g. "noisy_{snore_root}_{i}.wav"
-    """
     for split in ["Train", "Val", "Test"]:
         snore_dir = os.path.join(PREPROCESSED_DIR, split, "original", "1")
         non_snore_dir = os.path.join(PREPROCESSED_DIR, split, "mixing", "0")
@@ -236,7 +235,7 @@ def rebuild_noisy_data(num_versions=3):
         if not (os.path.isdir(snore_dir) and os.path.isdir(non_snore_dir)):
             continue
 
-        # Gather file lists
+        # Collect file lists
         snore_files = [f for f in os.listdir(snore_dir)
                        if f.lower().endswith((".wav", ".mp3"))]
         non_snore_files = [f for f in os.listdir(non_snore_dir)
@@ -244,28 +243,62 @@ def rebuild_noisy_data(num_versions=3):
         if not snore_files or not non_snore_files:
             continue
 
+        # Decide how many versions, whether to augment
+        if split == "Train":
+            num_versions = 3
+            do_augment = True
+        elif split == "Val":
+            num_versions = 3
+            do_augment = True
+        else:
+            # For 'Test'
+            num_versions = 1
+            do_augment = False
+
         for snore_fname in snore_files:
-            # Load the snore
+            # Load snore
             snore_path = os.path.join(snore_dir, snore_fname)
             snore_audio, sr_snore = load_and_preprocess(snore_path, TARGET_SR)
-            base_snore_root, _ = os.path.splitext(snore_fname)
 
-            # Generate multiple versions:
-            for i in range(1, num_versions + 1):
-                # PICK A DIFFERENT NON-SNORE EACH TIME (moved inside the loop)
+            # Parse snore label if you want:
+            snore_root, _ = os.path.splitext(snore_fname)
+            # e.g. "1_123"
+
+            for i in range(num_versions):
+                if not non_snore_files:
+                    print("No non-snore files available!")
+                    break
+
+                # Pick a random non-snore
                 chosen_non_snore_fname = random.choice(non_snore_files)
                 chosen_non_snore_path = os.path.join(non_snore_dir, chosen_non_snore_fname)
                 non_snore_audio, sr_ns = load_and_preprocess(chosen_non_snore_path, TARGET_SR)
 
-                # Make a copy & augment
-                non_snore_aug = non_snore_audio.copy()
-                non_snore_aug = random_augmentation_pipeline(non_snore_aug, sr_ns)
+                non_snore_root, _ = os.path.splitext(chosen_non_snore_fname)
+
+                # Possibly parse out "123" from "1_123" or "0_456"
+                # e.g.:
+                # snoreID = snore_root.replace("1_", "")
+                # nonSnoreID = non_snore_root.replace("0_", "")
+
+                # Augment or not
+                if do_augment:
+                    non_snore_aug = random_augmentation_pipeline(non_snore_audio.copy(), sr_ns)
+                else:
+                    non_snore_aug = non_snore_audio.copy()
 
                 # Mix
                 mixture = overlay_audio(snore_audio, non_snore_aug)
 
-                # Save
-                out_fname = f"noisy_{base_snore_root}_{i}.wav"
+                # Decide final name
+                if split == "Test":
+                    # For test, we embed both snore & non-snore ID
+                    # e.g. "noisy_1_123_0_456.wav" or simpler "noisy_123_456.wav"
+                    out_fname = f"noisy_{snore_root}_{non_snore_root}.wav"
+                else:
+                    # e.g. "noisy_{snore_root}_{i+1}.wav"
+                    out_fname = f"noisy_{snore_root}_{i+1}.wav"
+
                 out_path = os.path.join(noisy_dir, out_fname)
                 save_wav(out_path, mixture, TARGET_SR)
 

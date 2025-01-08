@@ -5,7 +5,6 @@ import sys
 import argparse
 import glob
 import csv
-import time
 import datetime
 import numpy as np
 import torch
@@ -16,7 +15,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 # ----------------------------------------------------------------------------
-# 1) Model imports or a factory function that provides your models
+# 1) Model imports (same factory approach)
 # ----------------------------------------------------------------------------
 from src.models.UNet1D import UNet1D
 from src.models.AdvancedCNNAutoencoder import AdvancedCNNAutoencoder
@@ -25,7 +24,7 @@ from src.models.WaveUNet1D import WaveUNet1D
 from src.models.ResUNet1D import ResUNet1D
 
 def get_model(model_name: str):
-    """Factory function returning an instance of the requested model."""
+    """Factory returning an instance of the requested model."""
     if model_name == 'UNet1D':
         return UNet1D()
     elif model_name == 'AdvancedCNNAutoencoder':
@@ -37,226 +36,239 @@ def get_model(model_name: str):
     elif model_name == 'ResUNet1D':
         return ResUNet1D()
     else:
-        raise ValueError(f"Unknown model name: {model_name}")
+        raise ValueError(f"Unknown model: {model_name}")
+
 
 # ----------------------------------------------------------------------------
-# 2) A Dataset that picks only files ending with "_1.wav"
-#    e.g. "noisy_1_195_1.wav", so we produce ONE reconstruction per snore
+# 2) Dataset for test files named: "noisy_1_{snoreID}_0_{nonSnoreID}.wav"
+#    but we store the raw wave (unscaled) + do the normalization separately.
 # ----------------------------------------------------------------------------
 class SingleNoisyDataset(Dataset):
     """
-    Loads .wav files from a directory, but only those ending with '_1.wav'.
-    We'll reconstruct these and compare to 'original/1/1_<middle>.wav'.
-    Potentially parse the non-snore if we had a stable naming. 
+    Loads .wav files from 'noisy_1_*_0_*.wav' in 'noisy_dir'.
+    Returns a tuple: (raw_noisy_wave, noisy_fname)
+    No normalization is done here, so we keep original amplitude for plotting.
     """
-    def __init__(self, noisy_dir):
+    def __init__(self, noisy_dir, sr=16000):
         super().__init__()
+        self.sr = sr
         self.noisy_paths = []
         all_wavs = glob.glob(os.path.join(noisy_dir, "*.wav"))
-        for path in all_wavs:
-            fname = os.path.basename(path)
-            if fname.endswith("_1.wav"):
-                self.noisy_paths.append(path)
+        for p in all_wavs:
+            fname = os.path.basename(p)
+            if fname.lower().startswith("noisy_1_") and "_0_" in fname:
+                self.noisy_paths.append(p)
 
-        print(f"[SingleNoisyDataset] Found {len(all_wavs)} total in '{noisy_dir}'")
-        print(f"                   Using {len(self.noisy_paths)} that match '*_1.wav'")
+        print(f"[SingleNoisyDataset] Found {len(all_wavs)} .wav in '{noisy_dir}'")
+        print(f"                   Using {len(self.noisy_paths)} that match 'noisy_1_*_0_*.wav'")
 
     def __len__(self):
         return len(self.noisy_paths)
 
     def __getitem__(self, idx):
         path = self.noisy_paths[idx]
-        wav, _ = librosa.load(path, sr=16000, mono=True)
-        maxval = np.max(np.abs(wav)) if len(wav) else 0
-        if maxval > 0:
-            wav = wav / maxval  # normalize to [-1,1]
+        # Load raw wave (no normalization)
+        raw_wave, _ = librosa.load(path, sr=self.sr, mono=True)
         fname = os.path.basename(path)
-        # Return the wave + base filename
-        return torch.tensor(wav, dtype=torch.float32), fname
+        return raw_wave, fname
+
 
 # ----------------------------------------------------------------------------
-# 3) Cosine Similarity function for waveforms
+# 3) Cosine Similarity
 # ----------------------------------------------------------------------------
 def cosine_similarity(a: np.ndarray, b: np.ndarray):
-    """
-    Cosine similarity = dot(a,b) / (||a|| * ||b||).
-    We'll pad or trim if lengths differ.
-    """
     length = min(len(a), len(b))
     a = a[:length]
     b = b[:length]
-
     dot = np.sum(a * b)
-    norm_a = np.sqrt(np.sum(a * a))
-    norm_b = np.sqrt(np.sum(b * b))
+    norm_a = np.sqrt(np.sum(a*a))
+    norm_b = np.sqrt(np.sum(b*b))
     if norm_a < 1e-9 or norm_b < 1e-9:
         return 0.0
     return dot / (norm_a * norm_b)
 
-# ----------------------------------------------------------------------------
-# 4) Inference & Cosine Similarity
-# ----------------------------------------------------------------------------
-def infer_and_evaluate(model, device, test_dir, out_dir, original_dir):
-    """
-    - test_dir: e.g. "Dataset/Preprocessed/Test/mixing/noisy"
-    - out_dir:  e.g. "Dataset/Preprocessed/Test/denoising"
-    - original_dir: "Dataset/Preprocessed/Test/original/1"
 
-    Returns: list of dict with fields:
-      {
-        "noisy_file": ...,
-        "reconstructed_file": ...,
-        "original_file": ...,
-        "cosine_similarity": float
-      }
+# ----------------------------------------------------------------------------
+# 4) Parsing "noisy_1_{snoreID}_0_{nonSnoreID}.wav"
+# ----------------------------------------------------------------------------
+def parse_test_filename(fname: str):
+    """
+    e.g. "noisy_1_94_0_33.wav" => snoreID=94, nonSnoreID=33
+    Return (snoreID, nonSnoreID).
+    If parse fails => (None, None).
+    """
+    base = os.path.splitext(fname)[0]
+    parts = base.split("_")
+    # e.g. parts=['noisy','1','94','0','33']
+    if len(parts) < 5:
+        return None, None
+    snoreID = parts[2]   # "94"
+    nonSnoreID = parts[4]# "33"
+    return snoreID, nonSnoreID
+
+
+# ----------------------------------------------------------------------------
+# 5) Inference + Evaluate
+# ----------------------------------------------------------------------------
+def infer_and_evaluate(model, device, test_dir, out_dir, snore_dir, nonsnore_dir, sr=16000):
+    """
+    - test_dir: e.g. 'Dataset/Preprocessed/Test/mixing/noisy'
+      has files "noisy_1_{snoreID}_0_{nonSnoreID}.wav" in original amplitude.
+    - out_dir: e.g. 'Dataset/Preprocessed/Test/denoising'
+    - snore_dir: e.g. 'Dataset/Preprocessed/Test/original/1'
+    - nonsnore_dir: e.g. 'Dataset/Preprocessed/Test/original/0'
+
+    Steps:
+      1) Load raw noisy => (raw_noisy, no normalization)
+      2) For model input => normalized_noisy = raw_noisy / max_abs_noisy
+      3) Model => normalized_recon
+      4) Re-scale => raw_reconstructed = normalized_recon * max_abs_noisy
+      5) Load raw snore => snore
+      6) Load raw non-snore => ns
+      7) Cos sim => compare normalized_recon vs normalized_snore
+         or raw vs raw, but typically we do it in normalized domain.
     """
     os.makedirs(out_dir, exist_ok=True)
-    dataset = SingleNoisyDataset(test_dir)
+    dataset = SingleNoisyDataset(test_dir, sr=sr)
     loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=2)
 
     results = []
     model.eval()
 
     with torch.no_grad():
-        for noisy_wav, noisy_fname in tqdm(loader, desc=f"Inference on {test_dir}"):
-            # shape: [1, waveform_length]
-            noisy_wav = noisy_wav.to(device)
-            # model expects [batch, channels, length] => [1,1,length]
-            noisy_wav = noisy_wav.unsqueeze(1)
+        for (raw_noisy_wave, noisy_fname) in tqdm(loader, desc=f"Inference on {test_dir}"):
+            raw_noisy_wave = raw_noisy_wave.numpy().squeeze()  # shape [length,]
+            # The max abs for scaling in/out the model
+            max_abs_noisy = np.max(np.abs(raw_noisy_wave)) if len(raw_noisy_wave) else 0.0
 
-            # e.g. "noisy_1_195_1.wav" => parse "195"
-            name_parts = os.path.splitext(noisy_fname[0])[0].split("_")
-            if len(name_parts) < 4:
-                continue
-            middle_id = name_parts[2]  # "195"
-
-            reconstructed_fname = f"reconstructed_{middle_id}.wav"
-            out_path = os.path.join(out_dir, reconstructed_fname)
-
-            # Forward pass
-            reconstructed = model(noisy_wav)
-            reconstructed_np = reconstructed.squeeze().cpu().numpy()
-
-            # Re-normalize
-            max_val = np.max(np.abs(reconstructed_np))
-            if max_val > 0:
-                reconstructed_np = reconstructed_np / max_val
-
-            sf.write(out_path, reconstructed_np, 16000)
-
-            # Compare with e.g. "1_{middle_id}.wav"
-            original_snore_fname = f"1_{middle_id}.wav"
-            original_snore_path = os.path.join(original_dir, original_snore_fname)
-            if not os.path.exists(original_snore_path):
-                cos_sim = 0.0
+            # Prepare model input
+            if max_abs_noisy > 1e-9:
+                normalized_noisy = raw_noisy_wave / max_abs_noisy
             else:
-                orig_wav, _ = librosa.load(original_snore_path, sr=16000, mono=True)
-                mv2 = np.max(np.abs(orig_wav)) if len(orig_wav) else 0
-                if mv2 > 0:
-                    orig_wav = orig_wav / mv2
-                cos_sim = cosine_similarity(reconstructed_np, orig_wav)
+                normalized_noisy = raw_noisy_wave  # all zeros?
+
+            # Convert to torch [batch=1, channels=1, length]
+            noisy_tensor = torch.tensor(normalized_noisy, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+
+            # parse snore & non-snore IDs
+            snoreID, nonSnoreID = parse_test_filename(noisy_fname[0])
+            if snoreID is None or nonSnoreID is None:
+                continue
+
+            # forward pass
+            recon_tensor = model(noisy_tensor)
+            recon_np = recon_tensor.squeeze().cpu().numpy()  # normalized [-1,1]
+
+            # re-scale back
+            raw_reconstructed = recon_np * max_abs_noisy
+
+            # Save as "reconstructed_{snoreID}_{nonSnoreID}.wav" in original amplitude
+            recon_fname = f"reconstructed_{snoreID}_{nonSnoreID}.wav"
+            out_path = os.path.join(out_dir, recon_fname)
+            sf.write(out_path, raw_reconstructed, sr)
+
+            # Load raw snore => "1_{snoreID}.wav"
+            snore_wave = None
+            snore_path = os.path.join(snore_dir, f"1_{snoreID}.wav")
+            if os.path.exists(snore_path):
+                snore_wave, _ = librosa.load(snore_path, sr=sr, mono=True)
+                # no normalization for plot
+
+            # Load raw non-snore => "0_{nonSnoreID}.wav"
+            nonsnore_wave = None
+            nonsnore_path = os.path.join(nonsnore_dir, f"0_{nonSnoreID}.wav")
+            if os.path.exists(nonsnore_path):
+                nonsnore_wave, _ = librosa.load(nonsnore_path, sr=sr, mono=True)
+
+            # Cosine sim: let's do it in normalized domain => recon_np vs. snore_normalized
+            cos_sim = 0.0
+            if snore_wave is not None:
+                # also normalize the snore wave to compare
+                max_abs_snore = np.max(np.abs(snore_wave)) if len(snore_wave) else 0
+                if max_abs_snore > 1e-9:
+                    snore_norm = snore_wave / max_abs_snore
+                    cos_sim = cosine_similarity(recon_np, snore_norm)
+                else:
+                    cos_sim = 0.0
 
             results.append({
                 "noisy_file": noisy_fname[0],
-                "reconstructed_file": reconstructed_fname,
-                "original_file": original_snore_fname,
+                "reconstructed_file": recon_fname,
+                "original_file": f"1_{snoreID}.wav",
                 "cosine_similarity": cos_sim,
-                # We'll store these waveforms in memory for potential plotting
-                "noisy_wave": noisy_wav.squeeze().cpu().numpy(),
-                "reconstructed_wave": reconstructed_np,
-                "original_snore_wave": orig_wav if os.path.exists(original_snore_path) else None
+                # store waveforms for final plotting
+                "original_non_snore_wave": nonsnore_wave,       # raw amplitude
+                "original_snore_wave": snore_wave,             # raw amplitude
+                "noisy_wave": raw_noisy_wave,                  # raw amplitude
+                "reconstructed_wave": raw_reconstructed        # raw amplitude
             })
+
     return results
 
+
 # ----------------------------------------------------------------------------
-# 5) Plotting Function for top/bottom 5
+# 6) Plotting in original amplitude
 # ----------------------------------------------------------------------------
-
-def plot_waveforms(original_ns, original_snore, noisy_wave, reconstructed_wave,
-                   title_str, out_file):
+def plot_waveforms(orig_ns, orig_snore, raw_noisy, raw_recon, cos_sim, out_file):
     """
-    Create a 4-subplot figure:
-      1) original non-snoring (if we have it, else zeros)
-      2) original snoring
-      3) noisy
-      4) reconstructed
-    Save to out_file (PNG or JPG).
+    4-subplot figure: 1) original non-snoring
+                      2) original snoring
+                      3) raw noisy
+                      4) raw reconstructed
     """
-    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(4, 1, figsize=(10,8), sharex=False)
+    fig.suptitle(f"CosSim = {cos_sim:.4f}")
 
-    fig, axes = plt.subplots(4, 1, figsize=(10, 8), sharex=False)
-    fig.suptitle(title_str)
+    if orig_ns is None:
+        orig_ns = np.zeros_like(raw_noisy)
+    axes[0].plot(orig_ns, color='gray')
+    axes[0].set_title("Original Non-Snore (raw amplitude)")
 
-    # 1) original non-snoring
-    if original_ns is None:
-        # fallback to zeros
-        original_ns = np.zeros_like(noisy_wave)  
-    axes[0].plot(original_ns, color='gray')
-    axes[0].set_title("Original Non-Snore")
+    if orig_snore is None:
+        orig_snore = np.zeros_like(raw_noisy)
+    axes[1].plot(orig_snore, color='g')
+    axes[1].set_title("Original Snore (raw amplitude)")
 
-    # 2) original snoring
-    if original_snore is None:
-        original_snore = np.zeros_like(noisy_wave)
-    axes[1].plot(original_snore, color='g')
-    axes[1].set_title("Original Snore")
+    axes[2].plot(raw_noisy, color='r')
+    axes[2].set_title("Noisy (raw amplitude)")
 
-    # 3) noisy
-    axes[2].plot(noisy_wave, color='r')
-    axes[2].set_title("Noisy")
+    axes[3].plot(raw_recon, color='b')
+    axes[3].set_title("Reconstructed (raw amplitude)")
 
-    # 4) reconstructed
-    axes[3].plot(reconstructed_wave, color='b')
-    axes[3].set_title("Reconstructed")
-
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.tight_layout()
     plt.savefig(out_file)
     plt.close(fig)
 
 
-def attempt_find_nonsnore(file_name):
-    """
-    If you truly want the original non-snore used in the mixture, you must have
-    stored that info. We'll do a naive approach: none.
-    Return None.
-    """
-    return None
-
-
-# ----------------------------------------------------------------------------
-# 6) Summarize + Save CSV + Plot
-# ----------------------------------------------------------------------------
 def compute_and_save_results(results, model_name):
     """
-    1) Print average, min, max
-    2) Save a CSV into results/{model_name}/Preprocessed/csv/<timestamp>.csv
-    3) Create top-5 and bottom-5 wave plots => results/{model_name}/Preprocessed/plot/<timestamp>/...
+    Sort by cos sim => top5/bottom5, write CSV, plot with original amplitude
     """
     if len(results) == 0:
-        print("\nNo results => skipping save/plots.")
+        print("No results => skip.")
         return
 
     cos_sims = [r["cosine_similarity"] for r in results]
-    avg_cos = sum(cos_sims) / len(cos_sims)
+    avg_cos = sum(cos_sims)/len(cos_sims)
     max_cos = max(cos_sims)
     min_cos = min(cos_sims)
 
-    max_record = max(results, key=lambda x: x["cosine_similarity"])
-    min_record = min(results, key=lambda x: x["cosine_similarity"])
+    best_rec = max(results, key=lambda x: x["cosine_similarity"])
+    worst_rec= min(results, key=lambda x: x["cosine_similarity"])
 
-    print(f"\n===== Cosine Similarity Summary =====")
-    print(f"Count: {len(cos_sims)}")
+    print(f"\n==== Cosine Similarity Summary ====")
+    print(f"Count: {len(results)}")
     print(f"Average: {avg_cos:.4f}")
-    print(f"Max: {max_cos:.4f} (file={max_record['reconstructed_file']})")
-    print(f"Min: {min_cos:.4f} (file={min_record['reconstructed_file']})")
+    print(f"Max: {max_cos:.4f} => {best_rec['reconstructed_file']}")
+    print(f"Min: {min_cos:.4f} => {worst_rec['reconstructed_file']}")
 
-    # Create subfolders with date/time
     now_str = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
-    csv_dir = os.path.join("results", model_name, "Preprocessed", "csv")
+    csv_dir  = os.path.join("results", model_name, "Preprocessed", "csv")
     plot_dir = os.path.join("results", model_name, "Preprocessed", "plot", now_str)
     os.makedirs(csv_dir, exist_ok=True)
     os.makedirs(plot_dir, exist_ok=True)
 
-    # 1) Save CSV
+    # Write CSV
     csv_path = os.path.join(csv_dir, f"{now_str}.csv")
     with open(csv_path, mode="w", newline="") as f:
         writer = csv.writer(f)
@@ -268,61 +280,52 @@ def compute_and_save_results(results, model_name):
                 r["original_file"],
                 f"{r['cosine_similarity']:.6f}"
             ])
-        # summary row
         writer.writerow([])
         writer.writerow(["METRICS","COUNT","AVERAGE","MAX","MIN"])
         writer.writerow([
             "COS_SIM",
-            len(cos_sims),
+            len(results),
             f"{avg_cos:.6f}",
-            f"{max_cos:.6f} ({max_record['reconstructed_file']})",
-            f"{min_cos:.6f} ({min_record['reconstructed_file']})"
+            f"{max_cos:.6f} ({best_rec['reconstructed_file']})",
+            f"{min_cos:.6f} ({worst_rec['reconstructed_file']})"
         ])
-    print(f"Saved CSV => {csv_path}")
+    print(f"CSV => {csv_path}")
 
-    # 2) Plot Top-5 & Bottom-5
-    sorted_results = sorted(results, key=lambda x: x["cosine_similarity"])
-    bottom_5 = sorted_results[:5]
-    top_5 = sorted_results[-5:]
+    # Plot top5 & bottom5 in raw amplitude
+    sorted_res = sorted(results, key=lambda x: x["cosine_similarity"])
+    bottom_5 = sorted_res[:5]
+    top_5    = sorted_res[-5:]
 
-    # For each example, we plot 4 waveforms: original non-snore, snore, noisy, reconstructed
-    # We'll skip actual non-snore unless we have logic to parse it.
-
-    def plot_example(r, prefix):
-        # attempt to find the original non-snoring wave
-        # (We do not have a real mapping in your code, but let's call a helper)
-        original_ns = attempt_find_nonsnore(r["noisy_file"])
-
-        original_snore = r["original_snore_wave"]  # might be None
-        noisy_wave = r["noisy_wave"]
-        reconstructed_wave = r["reconstructed_wave"]
-        sim_val = r["cosine_similarity"]
-
+    def do_plot(r, prefix):
         out_file = os.path.join(plot_dir, f"{prefix}_{r['reconstructed_file'].replace('.wav','')}.png")
-        title_str = f"{prefix.upper()} cos_sim={sim_val:.4f}"
-        plot_waveforms(original_ns, original_snore, noisy_wave, reconstructed_wave,
-                       title_str, out_file)
-
-    print(f"Creating plots in: {plot_dir}")
+        plot_waveforms(
+            r["original_non_snore_wave"],
+            r["original_snore_wave"],
+            r["noisy_wave"],
+            r["reconstructed_wave"],
+            r["cosine_similarity"],
+            out_file
+        )
 
     for r in top_5:
-        plot_example(r, prefix="best")
-
+        do_plot(r, "best")
     for r in bottom_5:
-        plot_example(r, prefix="worst")
+        do_plot(r, "worst")
 
-    print("Plots created for top 5 and bottom 5 similarity.")
+    print("Plotted top-5 & bottom-5 =>", plot_dir)
+
 
 # ----------------------------------------------------------------------------
 # 7) Main
 # ----------------------------------------------------------------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="Inference for snore denoising, with plotting.")
+    parser = argparse.ArgumentParser(description="Inference for snore denoising with 4-wave plots in original amplitude.")
     parser.add_argument("--model_name", type=str, required=True,
-                        help="UNet1D, AdvancedCNNAutoencoder, etc.")
+                        help="Which model: UNet1D, ResUNet1D, etc.")
     parser.add_argument("--ckpt_path", type=str, required=True,
-                        help="Path to .pth checkpoint")
-    parser.add_argument("--device", type=str, default="cuda")
+                        help="Path to .pth checkpoint.")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Device: 'cuda' or 'cpu'.")
     return parser.parse_args()
 
 def main():
@@ -336,20 +339,28 @@ def main():
     model.load_state_dict(state_dict, strict=False)
     model.to(device)
 
-    # 2) Do inference
-    pre_noisy_dir = "Dataset/Preprocessed/Test/mixing/noisy"
-    pre_denoise_dir = "Dataset/Preprocessed/Test/denoising"
-    pre_original_dir = "Dataset/Preprocessed/Test/original/1"
+    # 2) Inference
+    test_noisy_dir  = "Dataset/Preprocessed/Test/mixing/noisy"
+    test_denoise_dir= "Dataset/Preprocessed/Test/denoising"
+    test_snore_dir  = "Dataset/Preprocessed/Test/original/1"
+    test_ns_dir     = "Dataset/Preprocessed/Test/original/0"
 
-    if not os.path.exists(pre_noisy_dir):
-        print("[WARNING] No test dir found:", pre_noisy_dir)
-        return
+    if not os.path.exists(test_noisy_dir):
+        print(f"[ERROR] Not found: {test_noisy_dir}")
+        sys.exit(0)
 
-    results = infer_and_evaluate(model, device, pre_noisy_dir, pre_denoise_dir, pre_original_dir)
+    results = infer_and_evaluate(
+        model, device,
+        test_dir = test_noisy_dir,
+        out_dir  = test_denoise_dir,
+        snore_dir= test_snore_dir,
+        nonsnore_dir = test_ns_dir,
+        sr=16000
+    )
 
-    # 3) Summarize + Save + Plot
+    # 3) Summarize & Plot
     compute_and_save_results(results, args.model_name)
-    print("Inference complete!")
+    print("Inference complete.")
 
 if __name__ == "__main__":
     main()
