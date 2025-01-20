@@ -85,19 +85,20 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
 
+
 # ----------------------------------------------------------
 # 2) SnoreDataset
 # ----------------------------------------------------------
 class SnoreDataset(Dataset):
     """
-    Loads noisy files from e.g. 'noisy_1_44_2.wav' + tries to match with '1_44.wav'
-    so model can see the correct (input, target) pair.
+    Loads 'noisy_<scale>_snore-1_XXX_non-0_YYY.wav' => find the matching '1_XXX.wav'
+    from the "clean" directory. The clean snore is the training target.
     """
     def __init__(self, noisy_dir, clean_dir):
         super().__init__()
         self.noisy_files = glob.glob(os.path.join(noisy_dir, "*.wav"))
 
-        # Build a dictionary for clean files { "1_44.wav": "/full/path/1_44.wav" }
+        # Build a dictionary for clean files: { "1_005.wav": "/path/1_005.wav" }
         self.clean_map = {}
         for fpath in glob.glob(os.path.join(clean_dir, "*.wav")):
             fname = os.path.basename(fpath)
@@ -108,14 +109,18 @@ class SnoreDataset(Dataset):
 
     def parse_noisy_to_clean(self, noisy_name):
         """
-        e.g. 'noisy_1_44_2.wav' => '1_44.wav'
-        If it doesn't parse or doesn't exist in self.clean_map => fallback
+        Given something like:
+            'noisy_1.0_snore-1_005_non-0_123_aug2.wav'
+        we want to find the substring '1_005' from between 'snore-' and '_non-'
+        and then add '.wav' => '1_005.wav' which should be in clean_map.
         """
-        base_no_ext = os.path.splitext(noisy_name)[0]  # "noisy_1_44_2"
-        parts = base_no_ext.split("_")                 # ["noisy", "1", "44", "2"]
-        if len(parts) >= 3:
-            # join "1" + "_" + "44" => "1_44.wav"
-            candidate = parts[1] + "_" + parts[2] + ".wav"
+        base_no_ext = os.path.splitext(noisy_name)[0]
+        # e.g. "noisy_1.0_snore-1_005_non-0_123_aug2"
+        if ("snore-" in base_no_ext) and ("_non-" in base_no_ext):
+            # Extract the snore filename portion
+            after_snore = base_no_ext.split("snore-")[1]  # "1_005_non-0_123_aug2"
+            snore_part = after_snore.split("_non-")[0]    # "1_005"
+            candidate = snore_part + ".wav"               # "1_005.wav"
             return candidate
         return None
 
@@ -129,7 +134,7 @@ class SnoreDataset(Dataset):
         if max_abs_noisy > 1e-8:
             noisy_audio /= max_abs_noisy
 
-        # 2) Parse out the matching clean
+        # 2) Find the matching snore (clean) file
         clean_candidate = self.parse_noisy_to_clean(noisy_name)
         if clean_candidate and (clean_candidate in self.clean_map):
             clean_path = self.clean_map[clean_candidate]
@@ -159,22 +164,24 @@ class Trainer:
         self.train_dataset = SnoreDataset(args.train_noisy_dir, args.train_clean_dir)
         self.val_dataset   = SnoreDataset(args.val_noisy_dir, args.val_clean_dir)
 
-        if len(self.train_dataset) == 0 or len(self.val_dataset) == 0:
-            raise ValueError("No data found in the specified directories.")
+        if len(self.train_dataset) == 0:
+            raise ValueError(f"No training data in {args.train_noisy_dir}!")
+        if len(self.val_dataset) == 0:
+            raise ValueError(f"No validation data in {args.val_noisy_dir}!")
 
         self.train_loader = DataLoader(
             self.train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
             num_workers=4,
-            pin_memory=True,
+            pin_memory=True
         )
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=4,
-            pin_memory=True,
+            pin_memory=True
         )
 
         # 2) Create model
@@ -184,24 +191,35 @@ class Trainer:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        # 3) Optimizer & Scheduler
-        self.optimizer = optim.Adam(self.model.parameters(), lr=args.lr, weight_decay=1e-5)
+        # 3) Optimizer & LR Scheduler
+        self.optimizer = optim.Adam(
+            self.model.parameters(), lr=args.lr, weight_decay=1e-5
+        )
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', factor=0.5, patience=3, verbose=True
         )
 
         # 4) Loss & EarlyStopping
         self.criterion = combined_loss
-        self.early_stopping = EarlyStopping(patience=args.patience, min_delta=0.001)
+        self.early_stopping = EarlyStopping(patience=args.patience, min_delta=1e-3)
 
-        # 5) AMP Grad Scaler
+        # 5) AMP GradScaler
         self.scaler = GradScaler()
 
-        # 6) Where to save best model: exps/{model_name}/{DATE-TIME}/{model_name}.pth
+        # 6) Setup experiment folder
+        #    exps/noise_level_{0.5}/ResUNet1D/2025-01-21-12-00-00/weights_ResUNet1D.pth
         now_str = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
-        self.exp_dir = os.path.join("exps", args.model_name, now_str)
+        self.exp_dir = os.path.join(
+            "exps",
+            f"noise_level_{args.noise_level}",
+            args.model_name,
+            now_str
+        )
         os.makedirs(self.exp_dir, exist_ok=True)
-        self.model_path = os.path.join(self.exp_dir, f"{args.model_name}.pth")
+
+        self.model_path = os.path.join(
+            self.exp_dir, f"weights_{args.model_name}.pth"
+        )
 
     def train(self):
         best_val_loss = float("inf")
@@ -209,10 +227,7 @@ class Trainer:
         for epoch in range(self.args.epochs):
             print(f"\n----- EPOCH {epoch+1}/{self.args.epochs} -----")
 
-            # Train
             train_loss = self._train_one_epoch(epoch)
-
-            # Validate
             val_loss = self._validate(epoch)
 
             # Scheduler step
@@ -230,7 +245,7 @@ class Trainer:
                 print("Early stopping triggered.")
                 break
 
-        print(f"\nTraining completed. Best validation loss: {best_val_loss:.6f}")
+        print(f"Training completed. Best validation loss: {best_val_loss:.6f}")
         print(f"Best model at: {self.model_path}")
 
     def _train_one_epoch(self, epoch_idx):
