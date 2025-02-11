@@ -11,30 +11,39 @@ import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader
 
+# -----------------------------------------------------------------
+# Ensure we can import from src.models if 'src' is in the same dir.
+# -----------------------------------------------------------------
+import sys
+from pathlib import Path
+CURRENT_DIR = Path(__file__).resolve().parent
+sys.path.append(str(CURRENT_DIR))         # so we can do `import trainer` if needed
+sys.path.append(str(CURRENT_DIR / "src")) # so we can do `from models...` if your src is here
+
 # ----------------------------------------------------------
 # 1) Model Factory + Losses + EarlyStopping
 # ----------------------------------------------------------
-
 from src.models.UNet1D import UNet1D
 from src.models.AdvancedCNNAutoencoder import AdvancedCNNAutoencoder
 from src.models.AttentionUNet1D import AttentionUNet1D
 from src.models.WaveUNet1D import WaveUNet1D
 from src.models.ResUNet1D import ResUNet1D
 
-def get_model(model_name: str):
+def get_model(model_name: str, init_features=64, dropout_rate=0.15):
     """Factory function returning an instance of the requested model."""
     if model_name == 'UNet1D':
-        return UNet1D()
+        return UNet1D(init_features=init_features, dropout_rate=dropout_rate)
     elif model_name == 'AdvancedCNNAutoencoder':
-        return AdvancedCNNAutoencoder()
+        return AdvancedCNNAutoencoder(dropout_rate = dropout_rate)
     elif model_name == 'AttentionUNet1D':
         return AttentionUNet1D()
     elif model_name == 'WaveUNet1D':
-        return WaveUNet1D()
+        return WaveUNet1D(dropout_rate = dropout_rate)
     elif model_name == 'ResUNet1D':
-        return ResUNet1D()
+        return ResUNet1D(dropout_rate = dropout_rate)
     else:
         raise ValueError(f"Unknown model name: {model_name}")
+
 
 def stft_loss(pred, target):
     """
@@ -65,7 +74,7 @@ def combined_loss(pred, target):
 
 class EarlyStopping:
     """
-    If val_loss doesn't improve by min_delta for patience epochs, stop.
+    If val_loss doesn't improve by min_delta for 'patience' epochs, stop.
     """
     def __init__(self, patience=5, min_delta=0):
         self.patience = patience
@@ -78,21 +87,23 @@ class EarlyStopping:
         if self.best_loss is None:
             self.best_loss = val_loss
         elif val_loss < (self.best_loss - self.min_delta):
+            # improved
             self.best_loss = val_loss
             self.counter = 0
         else:
+            # not improved
             self.counter += 1
             if self.counter >= self.patience:
                 self.early_stop = True
-
 
 # ----------------------------------------------------------
 # 2) SnoreDataset
 # ----------------------------------------------------------
 class SnoreDataset(Dataset):
     """
-    Loads 'noisy_<scale>_snore-1_XXX_non-0_YYY.wav' => find the matching '1_XXX.wav'
-    from the "clean" directory. The clean snore is the training target.
+    Each item is (noisy_audio, clean_audio).
+    The 'noisy' path is e.g. /Train/mixing/noisy_0.5/noisy_0.5_snore-1_005_non-0_123.wav
+    We find the snore portion '1_005' and load /Train/original/1/1_005.wav as the clean target.
     """
     def __init__(self, noisy_dir, clean_dir):
         super().__init__()
@@ -109,32 +120,27 @@ class SnoreDataset(Dataset):
 
     def parse_noisy_to_clean(self, noisy_name):
         """
-        Given something like:
-            'noisy_1.0_snore-1_005_non-0_123_aug2.wav'
-        we want to find the substring '1_005' from between 'snore-' and '_non-'
-        and then add '.wav' => '1_005.wav' which should be in clean_map.
+        E.g. 'noisy_1.0_snore-1_005_non-0_123.wav' -> find substring '1_005'
+        and add '.wav' => '1_005.wav' which is in self.clean_map.
         """
         base_no_ext = os.path.splitext(noisy_name)[0]
-        # e.g. "noisy_1.0_snore-1_005_non-0_123_aug2"
         if ("snore-" in base_no_ext) and ("_non-" in base_no_ext):
-            # Extract the snore filename portion
-            after_snore = base_no_ext.split("snore-")[1]  # "1_005_non-0_123_aug2"
-            snore_part = after_snore.split("_non-")[0]    # "1_005"
-            candidate = snore_part + ".wav"               # "1_005.wav"
+            after_snore = base_no_ext.split("snore-")[1]
+            snore_part = after_snore.split("_non-")[0]
+            candidate = snore_part + ".wav"
             return candidate
         return None
 
     def __getitem__(self, idx):
-        # 1) Load the noisy file
         noisy_path = self.noisy_files[idx]
         noisy_name = os.path.basename(noisy_path)
 
+        # load & normalize
         noisy_audio, _ = librosa.load(noisy_path, sr=16000, mono=True)
         max_abs_noisy = np.max(np.abs(noisy_audio)) if len(noisy_audio) else 0
         if max_abs_noisy > 1e-8:
             noisy_audio /= max_abs_noisy
 
-        # 2) Find the matching snore (clean) file
         clean_candidate = self.parse_noisy_to_clean(noisy_name)
         if clean_candidate and (clean_candidate in self.clean_map):
             clean_path = self.clean_map[clean_candidate]
@@ -143,15 +149,11 @@ class SnoreDataset(Dataset):
             if max_abs_clean > 1e-8:
                 clean_audio /= max_abs_clean
         else:
-            # fallback to zeros if no match
             clean_audio = np.zeros_like(noisy_audio)
 
-        # Return as torch tensors [1, length]
         noisy_tensor = torch.tensor(noisy_audio, dtype=torch.float32).unsqueeze(0)
         clean_tensor = torch.tensor(clean_audio, dtype=torch.float32).unsqueeze(0)
-
         return (noisy_tensor, clean_tensor)
-
 
 # ----------------------------------------------------------
 # 3) Trainer
@@ -160,14 +162,14 @@ class Trainer:
     def __init__(self, args):
         self.args = args
 
-        # 1) Create dataset & DataLoader
+        # Create dataset & DataLoader
         self.train_dataset = SnoreDataset(args.train_noisy_dir, args.train_clean_dir)
         self.val_dataset   = SnoreDataset(args.val_noisy_dir, args.val_clean_dir)
 
         if len(self.train_dataset) == 0:
-            raise ValueError(f"No training data in {args.train_noisy_dir}!")
+            raise ValueError(f"No training data found in {args.train_noisy_dir}!")
         if len(self.val_dataset) == 0:
-            raise ValueError(f"No validation data in {args.val_noisy_dir}!")
+            raise ValueError(f"No validation data found in {args.val_noisy_dir}!")
 
         self.train_loader = DataLoader(
             self.train_dataset,
@@ -184,30 +186,30 @@ class Trainer:
             pin_memory=True
         )
 
-        # 2) Create model
-        self.model = get_model(args.model_name)
+        # Create model
+        self.model = get_model(args.model_name, init_features=args.init_features, dropout_rate=args.dropout_rate)
         if torch.cuda.device_count() > 1:
+            print(f"[INFO] Using {torch.cuda.device_count()} GPUs via DataParallel!")
             self.model = nn.DataParallel(self.model)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        # 3) Optimizer & LR Scheduler
+        # Optimizer & LR Scheduler (removed verbose to avoid warning)
         self.optimizer = optim.Adam(
             self.model.parameters(), lr=args.lr, weight_decay=1e-5
         )
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=3, verbose=True
+            self.optimizer, mode='min', factor=0.5, patience=3
         )
 
-        # 4) Loss & EarlyStopping
+        # Loss & EarlyStopping
         self.criterion = combined_loss
         self.early_stopping = EarlyStopping(patience=args.patience, min_delta=1e-3)
 
-        # 5) AMP GradScaler
+        # AMP GradScaler
         self.scaler = GradScaler()
 
-        # 6) Setup experiment folder
-        #    exps/noise_level_{0.5}/ResUNet1D/2025-01-21-12-00-00/weights_ResUNet1D.pth
+        # Setup experiment folder
         now_str = datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S')
         self.exp_dir = os.path.join(
             "exps",
@@ -217,9 +219,7 @@ class Trainer:
         )
         os.makedirs(self.exp_dir, exist_ok=True)
 
-        self.model_path = os.path.join(
-            self.exp_dir, f"weights_{args.model_name}.pth"
-        )
+        self.model_path = os.path.join(self.exp_dir, f"weights_{args.model_name}.pth")
 
     def train(self):
         best_val_loss = float("inf")
@@ -232,21 +232,23 @@ class Trainer:
 
             # Scheduler step
             self.scheduler.step(val_loss)
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f"Current Learning Rate: {current_lr:.6e}")
 
-            # Save if best
+            # Check if best
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 torch.save(self.model.state_dict(), self.model_path)
                 print(f"[SAVE] Best => {self.model_path} (val_loss={val_loss:.6f})")
 
-            # Early stop
+            # Early stopping
             self.early_stopping(val_loss)
             if self.early_stopping.early_stop:
-                print("Early stopping triggered.")
+                print("Early stopping triggered!")
                 break
 
-        print(f"Training completed. Best validation loss: {best_val_loss:.6f}")
-        print(f"Best model at: {self.model_path}")
+        print(f"Training done. Best validation loss: {best_val_loss:.6f}")
+        print(f"Best model saved at: {self.model_path}")
 
     def _train_one_epoch(self, epoch_idx):
         self.model.train()
@@ -269,7 +271,7 @@ class Trainer:
             total_loss += loss.item()
 
         epoch_loss = total_loss / len(self.train_loader)
-        print(f"TRAIN EPOCH {epoch_idx+1} - Loss: {epoch_loss:.6f}")
+        print(f"  [TRAIN] EPOCH {epoch_idx+1} - Loss: {epoch_loss:.6f}")
         return epoch_loss
 
     def _validate(self, epoch_idx):
@@ -288,5 +290,5 @@ class Trainer:
                 total_loss += loss.item()
 
         val_loss = total_loss / len(self.val_loader)
-        print(f"VAL EPOCH {epoch_idx+1} - Loss: {val_loss:.6f}")
+        print(f"  [VAL] EPOCH {epoch_idx+1} - Loss: {val_loss:.6f}")
         return val_loss
