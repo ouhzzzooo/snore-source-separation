@@ -5,6 +5,7 @@ import shutil
 import numpy as np
 import soundfile as sf
 import librosa
+import sys
 
 ###############################################################################
 #                          Configuration & Globals
@@ -19,37 +20,11 @@ SPLITS = ["Train", "Val", "Test"]
 # Classes: "1" = snore, "0" = non-snore
 CLASS_LABELS = ["1", "0"]
 
-# For mixing amplitude factors (only for non-snore audio)
+# For mixing amplitude factors
 MIXING_SCALES = [0.5, 1.0, 1.5]
 
 # Desired sample rate
 TARGET_SR = 16000
-
-# For static data augmentation
-# (Only used on non-snore in Train & Val)
-# Adjust these as you see fit to produce 3 distinct transformations
-def create_augmented_versions(audio, sr):
-    """
-    Return a list of 3 'static' augmented versions of the input audio.
-    You can modify these to be any transformations you like,
-    as long as they are deterministic (for "static" augmentation).
-    """
-    out_versions = []
-
-    # Version 1: Slight pitch shift up by +2 semitones
-    ver1 = librosa.effects.pitch_shift(audio, sr, n_steps=2)
-    out_versions.append(ver1)
-
-    # Version 2: Slight pitch shift down by -2 semitones
-    ver2 = librosa.effects.pitch_shift(audio, sr, n_steps=-2)
-    out_versions.append(ver2)
-
-    # Version 3: Add mild Gaussian noise
-    noise = np.random.RandomState(42).randn(len(audio)) * 0.01  # fixed seed => "static"
-    ver3 = audio + noise
-    out_versions.append(ver3)
-
-    return out_versions
 
 ###############################################################################
 #                           Basic Audio Utilities
@@ -126,15 +101,16 @@ def create_preprocessed_structure():
 
 
 ###############################################################################
-#              2) Preprocess "original" Folder (Downsample, Norm, Augment)
+#              2) Preprocess "original" Folder (Downsample & Normalize)
 ###############################################################################
 def preprocess_original_audio():
     """
     - For each split (Train/Val/Test), each class (snore=1, non-snore=0),
       load each file from Raw/<split>/original/<class>.
-    - Downsample & normalize => then optionally augment (if Train/Val & non-snore).
+    - Downsample & normalize => no augmentation.
     - Save results to Preprocessed/<split>/original/<class>.
     """
+    print("[INFO] Starting to preprocess 'original' folders...")
     for split in SPLITS:
         raw_split_dir = os.path.join(RAW_DIR, split, "original")
         prepro_split_dir = os.path.join(PREPROCESSED_DIR, split, "original")
@@ -146,35 +122,27 @@ def preprocess_original_audio():
             if not os.path.isdir(raw_class_dir):
                 continue
 
-            for fname in os.listdir(raw_class_dir):
-                if not fname.lower().endswith(".wav"):
-                    continue
+            file_list = [
+                f for f in os.listdir(raw_class_dir)
+                if f.lower().endswith(".wav")
+            ]
+            print(f"  -> Split: {split}, Class: {c}, Found {len(file_list)} files")
 
+            for idx, fname in enumerate(file_list, start=1):
                 in_path = os.path.join(raw_class_dir, fname)
-                base_name, ext = os.path.splitext(fname)  # e.g. ("0_123", ".wav")
+                base_name, _ = os.path.splitext(fname)
 
                 # Load & normalize
                 audio, sr = load_and_normalize(in_path, TARGET_SR)
 
-                # ----------------------------------------------------------------------------
-                #  If it's non-snore (c="0") AND in Train or Val => create 3 augmented copies
-                # ----------------------------------------------------------------------------
-                if c == "0" and split in ["Train", "Val"]:
-                    # Save the *original* version
-                    out_original = os.path.join(prepro_class_dir, f"{base_name}.wav")
-                    save_wav(out_original, audio, sr)
+                # Just save it back (no augmentation)
+                out_path = os.path.join(prepro_class_dir, f"{base_name}.wav")
+                save_wav(out_path, audio, sr)
 
-                    # Create 3 "static" augmented versions
-                    augmented_list = create_augmented_versions(audio, sr)
-                    for i, aug_audio in enumerate(augmented_list, start=1):
-                        out_aug = os.path.join(prepro_class_dir,
-                                               f"{base_name}_aug{i}.wav")
-                        save_wav(out_aug, aug_audio, sr)
+                if idx % 100 == 0:
+                    print(f"    Processed {idx}/{len(file_list)} for {split}/{c}...", flush=True)
 
-                else:
-                    # c="1" (snore) in any split, or c="0" in Test => no augmentation, just save
-                    out_original = os.path.join(prepro_class_dir, f"{base_name}.wav")
-                    save_wav(out_original, audio, sr)
+    print("[INFO] Finished preprocessing 'original' folders.\n")
 
 
 ###############################################################################
@@ -183,22 +151,32 @@ def preprocess_original_audio():
 def preprocess_real_mixing():
     """
     Copy all files from Raw/Test/real_mixing => Preprocessed/Test/real_mixing,
-    but also do the usual downsample+normalize.  No augmentation.
+    downsample+normalize as usual. No augmentation.
     """
+    print("[INFO] Preprocessing 'real_mixing' folder (Test only)...")
     raw_real_dir = os.path.join(RAW_DIR, "Test", "real_mixing")
     prepro_real_dir = os.path.join(PREPROCESSED_DIR, "Test", "real_mixing")
 
     if not os.path.isdir(raw_real_dir):
+        print("   -> No real_mixing folder found for Test.")
         return
 
-    for fname in os.listdir(raw_real_dir):
-        if not fname.lower().endswith(".wav"):
-            continue
+    file_list = [
+        f for f in os.listdir(raw_real_dir) if f.lower().endswith(".wav")
+    ]
+    print(f"   -> Found {len(file_list)} files in real_mixing")
+
+    for idx, fname in enumerate(file_list, start=1):
         in_path = os.path.join(raw_real_dir, fname)
         out_path = os.path.join(prepro_real_dir, fname)
 
         audio, sr = load_and_normalize(in_path, TARGET_SR)
         save_wav(out_path, audio, sr)
+
+        if idx % 100 == 0:
+            print(f"     Processed {idx}/{len(file_list)} real_mixing files...", flush=True)
+
+    print("[INFO] Finished preprocessing 'real_mixing' for Test.\n")
 
 
 ###############################################################################
@@ -209,45 +187,77 @@ def create_mixed_audio():
     For each split (Train/Val/Test):
       - We look at Preprocessed/<split>/original/1 (snore) and
         Preprocessed/<split>/original/0 (non-snore).
-      - For each snore file and each non-snore file (including augmented ones),
-        create 3 versions in the subfolders mixing/noisy_0.5, mixing/noisy_1.0, mixing/noisy_1.5.
-        The final name includes both snore and non-snore labels, e.g.:
-            noisy_0.5_snore-1_005_non-0_123_aug2.wav
-    - Note: If you want to limit the combinatorial explosion for Train, you could sample
-      fewer non-snore files. But this code does the full cross product.
+      - For each snore file and each non-snore file, create
+        3 versions in subfolders mixing/noisy_0.5, mixing/noisy_1.0, mixing/noisy_1.5.
+    - The final name includes something like:
+         noisy_0.5_snore-<snore_label>_non-<non_label>.wav
     """
+    print("[INFO] Creating mixed audio (snore + scale * non_snore)...")
+
     for split in SPLITS:
-        # Directories
         snore_dir = os.path.join(PREPROCESSED_DIR, split, "original", "1")
         non_snore_dir = os.path.join(PREPROCESSED_DIR, split, "original", "0")
         mixing_dir = os.path.join(PREPROCESSED_DIR, split, "mixing")
 
-        if not os.path.isdir(snore_dir) or not os.path.isdir(non_snore_dir):
+        if not (os.path.isdir(snore_dir) and os.path.isdir(non_snore_dir)):
+            print(f"  -> Skipping {split} (no snore_dir or non_snore_dir).")
             continue
 
-        snore_files = [f for f in os.listdir(snore_dir) if f.lower().endswith(".wav")]
-        non_snore_files = [f for f in os.listdir(non_snore_dir) if f.lower().endswith(".wav")]
+        # List .wav files
+        snore_files = [
+            f for f in os.listdir(snore_dir)
+            if f.lower().endswith(".wav")
+        ]
+        non_snore_files = [
+            f for f in os.listdir(non_snore_dir)
+            if f.lower().endswith(".wav")
+        ]
+        print(f"  -> Split: {split}, #snore={len(snore_files)}, #non-snore={len(non_snore_files)}")
 
-        for snore_f in snore_files:
-            snore_label = os.path.splitext(snore_f)[0]  # e.g. "1_005"
-            snore_path = os.path.join(snore_dir, snore_f)
-            snore_audio, _ = load_and_normalize(snore_path, TARGET_SR)
+        # ------------------------------------------------------------------
+        # A) Cache the audio in memory to avoid reloading for each mix
+        # ------------------------------------------------------------------
+        snore_cache = {}
+        for s_f in snore_files:
+            s_path = os.path.join(snore_dir, s_f)
+            s_audio, _ = load_and_normalize(s_path, TARGET_SR)
+            snore_cache[s_f] = s_audio
 
-            for non_f in non_snore_files:
-                non_label = os.path.splitext(non_f)[0]  # e.g. "0_123_aug2"
-                non_path = os.path.join(non_snore_dir, non_f)
-                non_audio, _ = load_and_normalize(non_path, TARGET_SR)
+        non_snore_cache = {}
+        for ns_f in non_snore_files:
+            ns_path = os.path.join(non_snore_dir, ns_f)
+            ns_audio, _ = load_and_normalize(ns_path, TARGET_SR)
+            non_snore_cache[ns_f] = ns_audio
 
-                # For each scale, create mixture
+        # ------------------------------------------------------------------
+        # B) Generate mixtures
+        # ------------------------------------------------------------------
+        total_combinations = len(snore_files) * len(non_snore_files) * len(MIXING_SCALES)
+        count = 0
+
+        for s_f in snore_files:
+            snore_label = os.path.splitext(s_f)[0]
+            snore_audio = snore_cache[s_f]
+
+            for ns_f in non_snore_files:
+                non_label = os.path.splitext(ns_f)[0]
+                non_audio = non_snore_cache[ns_f]
+
                 for scale in MIXING_SCALES:
                     mixed = overlay_audio(snore_audio, non_audio, scale=scale)
-
-                    # e.g. "noisy_0.5_snore-1_005_non-0_123_aug2.wav"
                     out_fname = f"noisy_{scale}_snore-{snore_label}_non-{non_label}.wav"
                     out_dir = os.path.join(mixing_dir, f"noisy_{scale}")
                     out_path = os.path.join(out_dir, out_fname)
 
                     save_wav(out_path, mixed, TARGET_SR)
+
+                    count += 1
+                    if count % 1000 == 0:
+                        print(f"    [Progress] {count}/{total_combinations} mixtures for {split}...", flush=True)
+
+        print(f"  -> Done creating mixtures for {split}: {count} total.\n")
+
+    print("[INFO] Finished creating mixed audio.\n")
 
 
 ###############################################################################
@@ -257,15 +267,13 @@ def main():
     # 1) Create folder structure under Dataset/Preprocessed
     create_preprocessed_structure()
 
-    # 2) Preprocess the "original" folders in Train/Val/Test
-    #    - Downsample & normalize everything
-    #    - For non-snore in Train/Val, produce 3 augmented copies
+    # 2) Preprocess the "original" folders (Train/Val/Test)
     preprocess_original_audio()
 
-    # 3) Preprocess "real_mixing" folder in Test
+    # 3) Preprocess "real_mixing" folder in Test (if present)
     preprocess_real_mixing()
 
-    # 4) Create the 3-scale mixing (0.5, 1.0, 1.5) for each snore + non-snore
+    # 4) Create the 3-scale mixing (0.5, 1.0, 1.5) for each snore+non-snore
     create_mixed_audio()
 
     print("All preprocessing steps complete!")
