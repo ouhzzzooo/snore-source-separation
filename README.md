@@ -36,10 +36,13 @@ Later too
 # Results
 Our strategy yields the following results
 
-| Model                | Denoising | Binary Classification |
-|----------------------|-----------|-----------------------|
-| UNet1D [1]           |    100    |     100               |
-| CNNAutoEncoder [2]   |    100    |     100               |
+| Model                | Similarity of Denoised | Binary Classification |
+|----------------------|------------------------|-----------------------|
+| UNet1D [1]           |         76.88          |     100               |
+| CNNAutoEncoder [2]   |         67.50+-        |     100               |
+| WaveUNet1D [3]       |         83.17          |     100               |
+| ResUNet1D [4]        |         xx.xx+-xx      |     100               |
+| AttentionUNet1D [5]  |         xx.xx+-xx      |     100               |
 
 # How to run
 
@@ -62,14 +65,16 @@ python prepareDataset.py
 python preprocessDataset.py
 ```
 
-### **Train model for denoising**
+### **Train model for denoised model weight**
 
 ```
-python train.py \
-  --model_name UNet1D \
-  --epochs 50 \
-  --batch_size 4 \
-  --train_noisy_dir Dataset/Preprocessed/Train/mixing/noisy \
+python train_all.py
+```
+
+### **Inference weight for denoising**
+
+```
+python inference_all.py
 ```
 
 # References
